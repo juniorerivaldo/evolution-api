@@ -12,6 +12,10 @@ WORKDIR /evolution
 COPY ./package*.json ./
 COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
+# patch-package patches (Baileys fixes, see PATCHES.md). They must be in place
+# before npm ci, whose postinstall applies them and fails the build if one does
+# not apply.
+COPY ./patches ./patches
 
 RUN npm ci --silent
 

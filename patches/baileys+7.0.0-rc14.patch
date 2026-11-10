@@ -1,0 +1,145 @@
+diff --git a/node_modules/baileys/lib/Socket/chats.js b/node_modules/baileys/lib/Socket/chats.js
+index 711e7f1..e886fc6 100644
+--- a/node_modules/baileys/lib/Socket/chats.js
++++ b/node_modules/baileys/lib/Socket/chats.js
+@@ -561,7 +561,12 @@ export const makeChatsSocket = (config) => {
+         const me = authState.creds.me;
+         const isSelf = me && (normalizedJid === jidNormalizedUser(me.id) || (me.lid && normalizedJid === jidNormalizedUser(me.lid)));
+         let tcTokenContent;
+-        if (serverProps.profilePicPrivacyToken && isUserJid && !isSelf) {
++        // [evolution-patched] For some contacts the server never answers a
++        // w:profile:picture IQ that carries <tctoken>, so each lookup waits the
++        // full 60s query timeout. rc.9 never sent it. Opt back in with
++        // BAILEYS_PROFILE_PIC_TCTOKEN=true.
++        const sendProfilePicTcToken = process.env.BAILEYS_PROFILE_PIC_TCTOKEN === 'true';
++        if (sendProfilePicTcToken && serverProps.profilePicPrivacyToken && isUserJid && !isSelf) {
+             tcTokenContent = await buildTcTokenFromJid({
+                 authState,
+                 jid: normalizedJid,
+diff --git a/node_modules/baileys/lib/Socket/messages-recv.js b/node_modules/baileys/lib/Socket/messages-recv.js
+index f2003ac..58550fd 100644
+--- a/node_modules/baileys/lib/Socket/messages-recv.js
++++ b/node_modules/baileys/lib/Socket/messages-recv.js
+@@ -1576,11 +1576,26 @@ export const makeMessagesRecvSocket = (config) => {
+             return exec(node, false).catch(err => onUnexpectedError(err, identifier));
+         }
+     };
++    // [evolution-patched] Some accounts now get contacts' statuses as a top-level
++    // <status> stanza instead of <message from="status@broadcast">. It isn't
++    // decoded here, but it must be acked: otherwise the server ends the stream
++    // ~50 minutes later with <stream:error><ack class="status"/></stream:error>
++    // and holds back new inbound messages meanwhile.
++    // Backport of WhiskeySockets/Baileys#2883 (evolution-api PR #2785, issue #2778).
++    const handleStatus = async (node) => {
++        try {
++            await sendMessageAck(node);
++        }
++        catch (error) {
++            onUnexpectedError(error, 'acking status stanza');
++        }
++    };
+     const offlineNodeProcessor = makeOfflineNodeProcessor(new Map([
+         ['message', handleMessage],
+         ['call', handleCall],
+         ['receipt', handleReceipt],
+-        ['notification', handleNotification]
++        ['notification', handleNotification],
++        ['status', handleStatus]
+     ]), {
+         isWsOpen: () => ws.isOpen,
+         onUnexpectedError,
+@@ -1621,6 +1636,10 @@ export const makeMessagesRecvSocket = (config) => {
+     ws.on('CB:notification', async (node) => {
+         await processNode('notification', node, 'handling notification', handleNotification);
+     });
++    ws.on('CB:status', async (node) => {
++        // processNode acks ignored JIDs itself, outside handleStatus' try/catch
++        await processNode('status', node, 'acking status stanza', handleStatus).catch(error => onUnexpectedError(error, 'acking status stanza'));
++    });
+     ws.on('CB:ack,class:message', (node) => {
+         handleBadAck(node).catch(error => onUnexpectedError(error, 'handling bad ack'));
+     });
+diff --git a/node_modules/baileys/lib/Socket/socket.js b/node_modules/baileys/lib/Socket/socket.js
+index ae34a8f..eca0fb6 100644
+--- a/node_modules/baileys/lib/Socket/socket.js
++++ b/node_modules/baileys/lib/Socket/socket.js
+@@ -802,13 +802,68 @@ export const makeSocket = (config) => {
+     ws.on('CB:ib,,downgrade_webclient', () => {
+         void end(new Boom('Multi-device beta not joined', { statusCode: DisconnectReason.multideviceMismatch }));
+     });
+-    ws.on('CB:ib,,offline_preview', async (node) => {
+-        logger.info('offline preview received', JSON.stringify(node));
++    // [evolution-patched] The server delivers at most `count` offline items per
++    // <offline_batch> request and then waits for the next request. Upstream asks
++    // only once, so a device with more than 100 pending items never finishes the
++    // offline sync and new messages stay queued behind the backlog
++    // (WhiskeySockets/Baileys#2810). Ask for another batch after a short quiet
++    // period until <ib><offline> arrives.
++    const OFFLINE_BATCH_SIZE = '100';
++    const OFFLINE_BATCH_IDLE_MS = Number(process.env.BAILEYS_OFFLINE_BATCH_IDLE_MS) > 0
++        ? Number(process.env.BAILEYS_OFFLINE_BATCH_IDLE_MS)
++        : 3000;
++    const OFFLINE_BATCH_MAX_REQUESTS = 200;
++    let offlineBatchRequests = 0;
++    let offlineBatchTimer;
++    let offlineSyncDone = false;
++    // only keep asking once the server has announced an offline sync
++    let offlinePreviewReceived = false;
++    const stopOfflineBatching = () => {
++        offlineSyncDone = true;
++        clearTimeout(offlineBatchTimer);
++        offlineBatchTimer = undefined;
++    };
++    const requestOfflineBatch = async () => {
++        offlineBatchRequests++;
+         await sendNode({
+             tag: 'ib',
+             attrs: {},
+-            content: [{ tag: 'offline_batch', attrs: { count: '100' } }]
++            content: [{ tag: 'offline_batch', attrs: { count: OFFLINE_BATCH_SIZE } }]
++        });
++    };
++    const armOfflineBatchTimer = () => {
++        if (!offlinePreviewReceived || offlineSyncDone || closed) {
++            return;
++        }
++        clearTimeout(offlineBatchTimer);
++        offlineBatchTimer = setTimeout(() => {
++            offlineBatchTimer = undefined;
++            if (offlineSyncDone || closed || !ws.isOpen) {
++                return;
++            }
++            if (offlineBatchRequests >= OFFLINE_BATCH_MAX_REQUESTS) {
++                logger.warn({ offlineBatchRequests }, 'offline sync still incomplete, giving up asking for more batches');
++                return;
++            }
++            logger.info({ offlineBatchRequests }, 'no offline item for a while, requesting next offline batch');
++            requestOfflineBatch()
++                .then(armOfflineBatchTimer)
++                .catch(err => logger.warn({ err }, 'failed to request next offline batch'));
++        }, OFFLINE_BATCH_IDLE_MS);
++    };
++    for (const tag of ['message', 'receipt', 'notification', 'call', 'status']) {
++        ws.on(`CB:${tag}`, (node) => {
++            if (node?.attrs?.offline) {
++                armOfflineBatchTimer();
++            }
+         });
++    }
++    socketEndHandlers.push(() => stopOfflineBatching());
++    ws.on('CB:ib,,offline_preview', async (node) => {
++        logger.info('offline preview received', JSON.stringify(node));
++        offlinePreviewReceived = true;
++        await requestOfflineBatch();
++        armOfflineBatchTimer();
+     });
+     ws.on('CB:ib,,edge_routing', (node) => {
+         const edgeRoutingNode = getBinaryNodeChild(node, 'edge_routing');
+@@ -830,6 +885,7 @@ export const makeSocket = (config) => {
+     });
+     // called when all offline notifs are handled
+     ws.on('CB:ib,,offline', (node) => {
++        stopOfflineBatching();
+         const child = getBinaryNodeChild(node, 'offline');
+         const offlineNotifs = +(child?.attrs.count || 0);
+         logger.info(`handled ${offlineNotifs} offline messages/notifications`);

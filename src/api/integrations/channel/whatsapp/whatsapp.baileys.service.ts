@@ -84,6 +84,7 @@ import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
+import { nonNegativeIntFromEnv, positiveIntFromEnv, ProfilePictureCache } from '@utils/profilePictureCache';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
@@ -255,6 +256,17 @@ export class BaileysStartupService extends ChannelStartupService {
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
+
+  // [evolution-patched] Profile picture lookups run inside the serial event queue
+  // (messages.upsert / contacts.*). Bound each one with a timeout and cache the
+  // result per JID, failures included, so one contact whose lookup never gets an
+  // answer cannot hold every incoming message for 60s (Baileys rc13+ default).
+  private readonly PROFILE_PICTURE_TIMEOUT_MS = positiveIntFromEnv(process.env.PROFILE_PICTURE_TIMEOUT_MS, 5000);
+  private readonly profilePictureCache = new ProfilePictureCache({
+    ttlMs: nonNegativeIntFromEnv(process.env.PROFILE_PICTURE_CACHE_TTL_SECONDS, 600) * 1000,
+    failureTtlMs: nonNegativeIntFromEnv(process.env.PROFILE_PICTURE_CACHE_FAILURE_TTL_SECONDS, 60) * 1000,
+    maxEntries: nonNegativeIntFromEnv(process.env.PROFILE_PICTURE_CACHE_MAX_ENTRIES, 5000),
+  });
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -847,7 +859,7 @@ export class BaileysStartupService extends ChannelStartupService {
           contacts.map(async (contact) => ({
             remoteJid: contact.id,
             pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-            profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+            profilePicUrl: (await this.profilePicture(contact.id, { cached: true })).profilePictureUrl,
             instanceId: this.instanceId,
           })),
         );
@@ -901,7 +913,11 @@ export class BaileysStartupService extends ChannelStartupService {
         contactsRaw.push({
           remoteJid: contact.id,
           pushName: contact?.name ?? contact?.verifiedName,
-          profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+          // imgUrl is set only when WhatsApp says the picture changed or was removed:
+          // look it up again then, otherwise reuse the cached result.
+          profilePicUrl: (
+            await this.profilePicture(contact.id, contact.imgUrl !== undefined ? { refresh: true } : { cached: true })
+          ).profilePictureUrl,
           instanceId: this.instanceId,
         });
       }
@@ -1501,7 +1517,7 @@ export class BaileysStartupService extends ChannelStartupService {
           } = {
             remoteJid: received.key.remoteJid,
             pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
+            profilePicUrl: (await this.profilePicture(received.key.remoteJid, { cached: true })).profilePictureUrl,
             instanceId: this.instanceId,
           };
 
@@ -2042,11 +2058,24 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
-  public async profilePicture(number: string) {
+  /**
+   * Looks up a profile picture URL. Every lookup is bounded by
+   * PROFILE_PICTURE_TIMEOUT_MS. Callers on the receive path pass `cached: true`
+   * so the result is reused per JID for PROFILE_PICTURE_CACHE_TTL_SECONDS;
+   * `refresh: true` forces a new lookup and stores it. The API route
+   * (`/chat/fetchProfilePictureUrl`) stays uncached and returns the same shape.
+   */
+  public async profilePicture(number: string, options: { cached?: boolean; refresh?: boolean } = {}) {
     const jid = createJid(number);
 
+    const fetchUrl = (target: string) =>
+      this.client.profilePictureUrl(target, 'image', this.PROFILE_PICTURE_TIMEOUT_MS);
+
     try {
-      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
+      const profilePictureUrl =
+        options.cached || options.refresh
+          ? await this.profilePictureCache.get(jid, fetchUrl, { refresh: options.refresh })
+          : await fetchUrl(jid);
 
       return { wuid: jid, profilePictureUrl };
     } catch {

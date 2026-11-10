@@ -9,7 +9,7 @@
     "start": "tsx ./src/main.ts",
     "start:prod": "node dist/main",
     "dev:server": "tsx watch ./src/main.ts",
-    "test": "tsx watch ./test/all.test.ts",
+    "test": "node --import tsx --test \"test/**/*.test.ts\" \"test/**/*.test.mjs\"",
     "lint": "eslint --fix --ext .ts src",
     "lint:check": "eslint --ext .ts src",
     "commit": "cz",
@@ -20,6 +20,7 @@
     "db:studio": "node runWithProvider.js \"npx prisma studio --schema ./prisma/DATABASE_PROVIDER-schema.prisma\"",
     "db:migrate:dev": "node runWithProvider.js \"rm -rf ./prisma/migrations && cp -r ./prisma/DATABASE_PROVIDER-migrations ./prisma/migrations && npx prisma migrate dev --schema ./prisma/DATABASE_PROVIDER-schema.prisma && cp -r ./prisma/migrations/* ./prisma/DATABASE_PROVIDER-migrations\"",
     "db:migrate:dev:win": "node runWithProvider.js \"xcopy /E /I prisma\\DATABASE_PROVIDER-migrations prisma\\migrations && npx prisma migrate dev --schema prisma\\DATABASE_PROVIDER-schema.prisma\"",
+    "postinstall": "patch-package --error-on-fail",
     "prepare": "husky"
   },
   "repository": {
@@ -64,6 +65,9 @@
       "path": "cz-conventional-changelog"
     }
   },
+  "overrides": {
+    "whatsapp-rust-bridge": "0.5.5"
+  },
   "dependencies": {
     "@adiwajshing/keyed-db": "^0.2.4",
     "@aws-sdk/client-sqs": "^3.891.0",
@@ -77,7 +81,7 @@
     "amqplib": "^0.10.5",
     "audio-decode": "^2.2.3",
     "axios": "^1.7.9",
-    "baileys": "7.0.0-rc.9",
+    "baileys": "7.0.0-rc14",
     "class-validator": "^0.14.1",
     "compression": "^1.7.5",
     "cors": "^2.8.5",
@@ -153,6 +157,7 @@
     "prettier": "^3.4.2",
     "tsconfig-paths": "^4.2.0",
     "tsx": "^4.20.5",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "patch-package": "^8.0.1"
   }
 }
